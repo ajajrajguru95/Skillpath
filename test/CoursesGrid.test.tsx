@@ -256,6 +256,15 @@ describe("country lookup failure", () => {
         expect(screen.getByText(/couldn’t confirm your region/)).toBeInTheDocument()
     })
 
+    it("survives a fallback currency the panel did not sanitise", async () => {
+        server.use(coursesRespond([youtubeCourse]), countryFail())
+        // Framer serialises the enum by its title; a bad value must not reach the
+        // formatter lookup, where a miss would throw and blank the section.
+        renderGrid({ fallbackCurrency: "India (INR)" as never })
+
+        expect(await screen.findByText("₹1,999.00")).toBeInTheDocument()
+    })
+
     it("shows no notice when the lookup succeeds", async () => {
         server.use(coursesRespond([youtubeCourse]), countryRespond("IN"))
         renderGrid()
