@@ -9,3 +9,6 @@ Thumbs.db
 
 # The assignment brief is not ours to publish
 *.pdf
+
+# Scratch output from browser tooling
+.playwright-mcp/

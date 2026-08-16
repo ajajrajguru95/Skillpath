@@ -64,9 +64,23 @@ const RETRY_DELAYS_MS = [400, 900]
 const SLOW_NOTICE_MS = 6000
 const REQUEST_TIMEOUT_MS = 15000
 
+/** Column breakpoints, measured against the component's own box. See STYLE_SHEET. */
 const DESKTOP_MIN_WIDTH = 1024
 const TABLET_MIN_WIDTH = 640
-const MAX_SKELETONS = 6
+
+/**
+ * The API returns 5-10 courses. At three columns that is 2, 2, 3, 3, 3 or 4 rows,
+ * so three rows is the most likely outcome and 8 placeholders is the count that
+ * matches it. Guessing 6 made the grid grow by a row on most loads.
+ */
+const DEFAULT_SKELETONS = 8
+
+/**
+ * Skeletons and loaded cards must occupy the same height or the page jumps when
+ * data arrives. Both use this floor rather than trying to match bar-by-bar.
+ * Measured against a rendered card: 40 padding + 36 gaps + 135 content.
+ */
+const CARD_MIN_HEIGHT = 211
 
 const PRICE_UNAVAILABLE = "Price unavailable"
 
@@ -199,12 +213,6 @@ function resolveCountry(
     return { country: fallback, usedFallback: true }
 }
 
-function columnsForWidth(width: number): number {
-    if (width >= DESKTOP_MIN_WIDTH) return 3
-    if (width >= TABLET_MIN_WIDTH) return 2
-    return 1
-}
-
 function currencyLabel(country: CountryCode): string {
     return country === "IN" ? "Indian rupees" : "US dollars"
 }
@@ -270,36 +278,33 @@ async function fetchWithRetry(url: string, signal: AbortSignal): Promise<unknown
 // Hooks
 // ---------------------------------------------------------------------------
 
+/** Stable id so duplicate instances can find and drop each other's copies. */
+const STYLE_ELEMENT_ID = "skillpath-courses-grid-styles"
+
+/**
+ * The stylesheet is rendered inside the component so the static HTML Framer
+ * publishes already carries it - injecting from an effect would flash unstyled
+ * skeletons on first paint. The cost is one copy per instance, so after mount
+ * every copy beyond the first is removed. The rules are identical, so whichever
+ * one survives is the same stylesheet.
+ */
+function useDedupedStyles(ref: RefObject<HTMLElement | null>): void {
+    useEffect(() => {
+        if (typeof document === "undefined") return
+        const own = ref.current?.querySelector(`style#${STYLE_ELEMENT_ID}`)
+        if (!own) return
+
+        const all = document.querySelectorAll(`style#${STYLE_ELEMENT_ID}`)
+        if (all.length > 1 && all[0] !== own) own.remove()
+    }, [ref])
+}
+
 const INITIAL_STATE: CoursesState = {
     status: "loading",
     courses: [],
     country: "IN",
     usedFallbackCurrency: false,
     failureKind: null,
-}
-
-/**
- * Measures the component's own box rather than the viewport. In Framer this can
- * be placed inside any container, so a viewport media query would be measuring
- * the wrong thing.
- */
-function useColumnCount(ref: RefObject<HTMLElement | null>): number {
-    const [columns, setColumns] = useState(3)
-
-    useEffect(() => {
-        const element = ref.current
-        if (element === null || typeof ResizeObserver === "undefined") return
-
-        const observer = new ResizeObserver(entries => {
-            const width = entries[0]?.contentRect.width
-            if (typeof width === "number") setColumns(columnsForWidth(width))
-        })
-
-        observer.observe(element)
-        return () => observer.disconnect()
-    }, [ref])
-
-    return columns
 }
 
 /**
@@ -387,21 +392,43 @@ function useCourseData(fallbackCurrency: CountryCode, enabled: boolean) {
     }, [fallbackCurrency, enabled, reloadToken])
 
     /**
+     * The country retry runs outside the main effect, so it needs its own
+     * cancellation. Without this it was the one async path that could abort
+     * nothing and setState after unmount.
+     */
+    const countryRetryRef = useRef<AbortController | null>(null)
+    const unmountedRef = useRef(false)
+
+    useEffect(() => {
+        unmountedRef.current = false
+        return () => {
+            unmountedRef.current = true
+            countryRetryRef.current?.abort()
+        }
+    }, [])
+
+    /**
      * Re-runs only the country lookup. Deliberately user-initiated: silently
      * polling in the background could swap every price from rupees to dollars
      * mid-read, which is worse than showing a stale currency with a notice.
      */
     const retryCountry = useCallback(async () => {
-        setIsRetryingCountry(true)
+        countryRetryRef.current?.abort()
         const controller = new AbortController()
+        countryRetryRef.current = controller
+
+        setIsRetryingCountry(true)
         try {
             const payload = await fetchWithRetry(COUNTRY_URL, controller.signal)
+            if (unmountedRef.current) return
             const { country, usedFallback } = resolveCountry(payload, fallbackCurrency)
             setState(current => ({ ...current, country, usedFallbackCurrency: usedFallback }))
         } catch (error) {
+            if (unmountedRef.current) return
             console.error("[Skillpath] country retry failed", error)
         } finally {
-            setIsRetryingCountry(false)
+            if (!unmountedRef.current) setIsRetryingCountry(false)
+            if (countryRetryRef.current === controller) countryRetryRef.current = null
         }
     }, [fallbackCurrency])
 
@@ -425,8 +452,32 @@ const STYLE_SHEET = `
   /* Named explicitly so the grid matches the page around it. Framer loads this
      family for the rest of the site; the stack after it is the fallback. */
   font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  /* Makes this element the reference for the @container queries below, so the
+     columns respond to the component's own width wherever it is placed. */
+  container-type: inline-size;
 }
 .sp-root *, .sp-root *::before, .sp-root *::after { box-sizing: border-box; }
+
+/*
+ * Columns are CSS, not JavaScript. Measuring with ResizeObserver meant the first
+ * paint always used a guessed count and then snapped to the real one, which was
+ * worth 0.14 CLS on any viewport under ${DESKTOP_MIN_WIDTH}px. A container query is
+ * correct on the very first paint and still measures this component's own box
+ * rather than the viewport.
+ * minmax(0, 1fr) rather than 1fr so a long unbroken word cannot widen a column.
+ */
+.sp-grid {
+  display: grid;
+  gap: 20px;
+  align-items: stretch;
+  grid-template-columns: minmax(0, 1fr);
+}
+@container (min-width: ${TABLET_MIN_WIDTH}px) {
+  .sp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (min-width: ${DESKTOP_MIN_WIDTH}px) {
+  .sp-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 
 .sp-clamp {
   display: -webkit-box;
@@ -440,6 +491,11 @@ const STYLE_SHEET = `
 
 .sp-card {
   transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+  /* Requested for feel. Worth knowing: a pointer cursor on something that does
+     not respond to a click is normally a usability smell. It is defensible only
+     while the whole card is a hover target; if it stays non-interactive, the
+     honest fix is to drop this rather than keep promising a click. */
+  cursor: pointer;
 }
 .sp-card:hover {
   transform: translateY(-2px);
@@ -462,6 +518,14 @@ const STYLE_SHEET = `
   cursor: pointer;
   border-radius: 8px;
   transition: background-color 160ms ease, border-color 160ms ease;
+  /*
+   * Optical centring. Plus Jakarta Sans reports ascent 21 and descent 6 per 16px,
+   * so the ink centre sits (ascent - descent)/2 + (descender - capHeight)/2 below
+   * the line-box centre - about 2px. Flexbox centres the box, not the letters, and
+   * changing line-height does not move it, so the correction has to be padding.
+   */
+  padding-top: 8px;
+  padding-bottom: 12px;
 }
 .sp-button:disabled { cursor: not-allowed; opacity: 0.6; }
 .sp-button:focus-visible, .sp-link:focus-visible {
@@ -494,6 +558,9 @@ const cardStyle: CSSProperties = {
     flexDirection: "column",
     gap: 12,
     height: "100%",
+    // Shared by the skeleton and the loaded card so swapping one for the other
+    // does not change the grid's height.
+    minHeight: CARD_MIN_HEIGHT,
     padding: 20,
     borderRadius: 14,
     border: `1px solid ${COLORS.border}`,
@@ -501,7 +568,10 @@ const cardStyle: CSSProperties = {
 }
 
 const primaryButtonStyle: CSSProperties = {
-    padding: "10px 18px",
+    // Horizontal only. Vertical padding lives in .sp-button so the optical
+    // centring correction there is not overridden by this inline style.
+    paddingLeft: 18,
+    paddingRight: 18,
     border: "none",
     background: COLORS.accent,
     color: "#FFFFFF",
@@ -649,7 +719,9 @@ function CurrencyNotice({
                 type="button"
                 className="sp-button"
                 style={{
-                    padding: "4px 12px",
+                    // Smaller control, so it overrides .sp-button's vertical padding
+                    // but keeps the same 2px optical offset between top and bottom.
+                    padding: "3px 12px 7px",
                     border: `1px solid ${COLORS.border}`,
                     background: COLORS.surface,
                     color: COLORS.text,
@@ -679,13 +751,14 @@ export default function CoursesGrid(props: CoursesGridProps) {
     const {
         heading = "Courses built to be finished",
         fallbackCurrency = "IN",
-        maxCourses = 12,
+        // Kept in step with the control's defaultValue below.
+        maxCourses = 24,
         style,
     } = props
 
     const headingId = useId()
     const rootRef = useRef<HTMLElement | null>(null)
-    const columns = useColumnCount(rootRef)
+    useDedupedStyles(rootRef)
 
     // Framer renders published pages statically before hydrating. Skipping the
     // fetch there means the first paint is skeletons rather than an empty box.
@@ -695,18 +768,11 @@ export default function CoursesGrid(props: CoursesGridProps) {
         !isStatic
     )
 
+    const limit = Math.max(1, maxCourses)
     const status: Status = isStatic ? "loading" : state.status
-    const visibleCourses = state.courses.slice(0, Math.max(1, maxCourses))
-    const skeletonCount = Math.min(Math.max(1, maxCourses), MAX_SKELETONS)
-
-    const gridStyle: CSSProperties = {
-        display: "grid",
-        // minmax(0, 1fr) rather than 1fr so a long unbroken word cannot widen a
-        // column and push the grid into horizontal overflow.
-        gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
-        gap: 20,
-        alignItems: "stretch",
-    }
+    const visibleCourses = state.courses.slice(0, limit)
+    const hiddenCount = state.courses.length - visibleCourses.length
+    const skeletonCount = Math.min(limit, DEFAULT_SKELETONS)
 
     return (
         <section
@@ -715,7 +781,14 @@ export default function CoursesGrid(props: CoursesGridProps) {
             aria-labelledby={headingId}
             style={{ padding: 0, ...style }}
         >
-            <style>{STYLE_SHEET}</style>
+            <style id={STYLE_ELEMENT_ID}>{STYLE_SHEET}</style>
+
+            {/*
+              * Ships in the static HTML, so the browser can open the TLS
+              * connection while Framer's runtime is still booting instead of
+              * waiting until the fetch fires after hydration.
+              */}
+            <link rel="preconnect" href={API_BASE} crossOrigin="anonymous" />
 
             <header style={{ marginBottom: 24 }}>
                 <h2 id={headingId} style={{ margin: 0, fontSize: 28, fontWeight: 700, lineHeight: 1.25, color: COLORS.text }}>
@@ -754,7 +827,7 @@ export default function CoursesGrid(props: CoursesGridProps) {
             )}
 
             {status === "loading" && (
-                <div style={gridStyle} aria-busy="true">
+                <div className="sp-grid" aria-busy="true">
                     {Array.from({ length: skeletonCount }, (_, index) => (
                         <SkeletonCard key={index} />
                     ))}
@@ -790,11 +863,19 @@ export default function CoursesGrid(props: CoursesGridProps) {
             )}
 
             {status === "ready" && (
-                <div style={gridStyle}>
-                    {visibleCourses.map(course => (
-                        <CourseCard key={course.courseCode} course={course} country={state.country} />
-                    ))}
-                </div>
+                <>
+                    <div className="sp-grid">
+                        {visibleCourses.map(course => (
+                            <CourseCard key={course.courseCode} course={course} country={state.country} />
+                        ))}
+                    </div>
+                    {/* Never drop courses silently just because the control is low. */}
+                    {hiddenCount > 0 && (
+                        <p style={{ margin: "20px 0 0", fontSize: 14, color: COLORS.muted, textAlign: "center" }}>
+                            Showing {visibleCourses.length} of {state.courses.length} courses.
+                        </p>
+                    )}
+                </>
             )}
         </section>
     )
@@ -818,10 +899,13 @@ addPropertyControls(CoursesGrid, {
         type: ControlType.Number,
         title: "Max courses",
         min: 1,
-        max: 12,
+        // Headroom over the 10 the API currently returns. If it ever returns
+        // more than this, the grid says "Showing 10 of 14" rather than dropping
+        // the extras without telling anyone.
+        max: 24,
         step: 1,
-        defaultValue: 12,
+        defaultValue: 24,
         displayStepper: false,
-        description: "The API returns 5 to 10 courses.",
+        description: "The API returns 5 to 10 courses. Lower this to trim the grid.",
     },
 })

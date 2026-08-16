@@ -31,8 +31,4 @@ describe("test environment", () => {
         expect(typeof document).toBe("object")
         expect(document.createElement("div")).toBeInstanceOf(HTMLElement)
     })
-
-    it("installs the ResizeObserver stub the column logic depends on", () => {
-        expect(typeof ResizeObserver).toBe("function")
-    })
 })
