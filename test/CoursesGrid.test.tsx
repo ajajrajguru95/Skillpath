@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { act, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { http } from "msw"
 import CoursesGrid from "../framer/CoursesGrid"
 import { registeredControls } from "./stubs/framer"
-import { setContainerWidth } from "./resize-observer"
+import { COUNTRY_URL } from "./fixtures"
 import {
     countryFail,
     countryFailThenSucceed,
@@ -95,6 +96,32 @@ describe("loading state", () => {
 
         // Two skeleton cards, each containing several shimmer bars.
         expect(container.querySelectorAll("[aria-hidden='true']").length).toBe(2)
+    })
+
+    it("renders eight skeletons by default, matching the usual row count", () => {
+        server.use(coursesHang())
+        const { container } = renderGrid()
+
+        // The API returns 5-10 courses, which is three rows at three columns more
+        // often than any other count. Guessing six grew the grid on most loads.
+        expect(container.querySelectorAll("[aria-hidden='true']").length).toBe(8)
+    })
+
+    it("gives skeletons and loaded cards the same minimum height", async () => {
+        server.use(coursesHang())
+        const { container, unmount } = renderGrid()
+        const skeleton = container.querySelector("[aria-hidden='true']") as HTMLElement
+        const skeletonMinHeight = skeleton.style.minHeight
+        unmount()
+
+        server.resetHandlers()
+        server.use(coursesRespond([youtubeCourse]))
+        renderGrid()
+        const card = (await screen.findByText(youtubeCourse.courseName)).closest("article") as HTMLElement
+
+        // Equal floors are what stop the grid jumping when data replaces skeletons.
+        expect(skeletonMinHeight).toBe(card.style.minHeight)
+        expect(skeletonMinHeight).not.toBe("")
     })
 
     it("clears aria-busy once the courses arrive", async () => {
@@ -325,43 +352,43 @@ describe("card content", () => {
 })
 
 describe("responsive grid", () => {
-    /** Mounts once, then reports the column rule at any width the caller asks for. */
-    async function mountGrid() {
+    /**
+     * Columns are container queries, not JavaScript, so jsdom cannot evaluate
+     * them - it performs no layout. These assertions check the rules the
+     * component actually ships; the resulting layout is verified in a browser.
+     */
+    async function styleSheetText() {
         server.use(coursesRespond(threeCourses))
         const { container } = renderGrid()
         await screen.findByText(youtubeCourse.courseName)
-
-        const grid = container.querySelector("[style*='grid-template-columns']") as HTMLElement
-
-        return function columnsAt(width: number) {
-            act(() => setContainerWidth(width))
-            return grid.style.gridTemplateColumns
-        }
+        return container.querySelector("style")?.textContent ?? ""
     }
 
-    it("uses three columns on desktop", async () => {
-        const columnsAt = await mountGrid()
-        expect(columnsAt(1440)).toBe("repeat(3, minmax(0, 1fr))")
+    it("makes itself the query container, so it measures its own box", async () => {
+        expect(await styleSheetText()).toMatch(/\.sp-root\s*\{[^}]*container-type:\s*inline-size/)
     })
 
-    it("uses two columns on tablet", async () => {
-        const columnsAt = await mountGrid()
-        expect(columnsAt(800)).toBe("repeat(2, minmax(0, 1fr))")
+    it("defaults to a single column before any query matches", async () => {
+        expect(await styleSheetText()).toMatch(
+            /\.sp-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/
+        )
     })
 
-    it("uses one column on mobile", async () => {
-        const columnsAt = await mountGrid()
-        expect(columnsAt(375)).toBe("repeat(1, minmax(0, 1fr))")
+    it("steps to two columns at 640 and three at 1024", async () => {
+        const css = await styleSheetText()
+        expect(css).toMatch(
+            /@container \(min-width: 640px\)\s*\{\s*\.sp-grid \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/
+        )
+        expect(css).toMatch(
+            /@container \(min-width: 1024px\)\s*\{\s*\.sp-grid \{ grid-template-columns: repeat\(3, minmax\(0, 1fr\)\); \}/
+        )
     })
 
-    it("does not break at the breakpoint boundaries", async () => {
-        const columnsAt = await mountGrid()
-        expect(columnsAt(1024)).toBe("repeat(3, minmax(0, 1fr))")
-        expect(columnsAt(1023)).toBe("repeat(2, minmax(0, 1fr))")
-        expect(columnsAt(640)).toBe("repeat(2, minmax(0, 1fr))")
-        expect(columnsAt(639)).toBe("repeat(1, minmax(0, 1fr))")
-        // Nothing collapses to zero columns at a degenerate width.
-        expect(columnsAt(0)).toBe("repeat(1, minmax(0, 1fr))")
+    it("uses minmax(0, 1fr) everywhere so a long word cannot cause overflow", async () => {
+        const css = await styleSheetText()
+        const columnRules = css.match(/grid-template-columns:[^;]+;/g) ?? []
+        expect(columnRules.length).toBeGreaterThan(0)
+        for (const rule of columnRules) expect(rule).toContain("minmax(0, 1fr)")
     })
 
     it("renders a ragged final row without padding it out", async () => {
@@ -408,6 +435,21 @@ describe("property controls", () => {
 
         await screen.findByText(youtubeCourse.courseName)
         expect(container.querySelectorAll("article")).toHaveLength(2)
+    })
+
+    it("says how many courses were hidden rather than dropping them silently", async () => {
+        server.use(coursesRespond(threeCourses))
+        renderGrid({ maxCourses: 2 })
+
+        expect(await screen.findByText("Showing 2 of 3 courses.")).toBeInTheDocument()
+    })
+
+    it("shows no count when everything fits", async () => {
+        server.use(coursesRespond(threeCourses))
+        renderGrid({ maxCourses: 24 })
+
+        await screen.findByText(youtubeCourse.courseName)
+        expect(screen.queryByText(/Showing \d+ of/)).not.toBeInTheDocument()
     })
 })
 
@@ -463,6 +505,25 @@ describe("request discipline", () => {
         await new Promise(resolve => setTimeout(resolve, 50))
 
         // The disposed guard runs before any setState or logging.
+        expect(consoleError).not.toHaveBeenCalled()
+    })
+
+    it("cancels an in-flight country retry on unmount too", async () => {
+        const user = userEvent.setup()
+        server.use(coursesRespond([youtubeCourse]), countryFail())
+        const { unmount } = renderGrid()
+
+        await screen.findByText(youtubeCourse.courseName)
+
+        // Country now hangs, so the retry is still in flight at unmount. This was
+        // the one async path with no cancellation.
+        server.use(http.get(COUNTRY_URL, () => new Promise<never>(() => {})))
+        await user.click(screen.getByRole("button", { name: "Try again" }))
+
+        consoleError.mockClear()
+        unmount()
+        await new Promise(resolve => setTimeout(resolve, 100))
+
         expect(consoleError).not.toHaveBeenCalled()
     })
 })
