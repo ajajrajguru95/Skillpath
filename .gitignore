@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+
+# The assignment brief is not ours to publish
+*.pdf
