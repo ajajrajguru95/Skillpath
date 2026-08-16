@@ -7,6 +7,7 @@ roughly one request in three on purpose.
 **Live:** https://personal-airport-225722.framer.app
 **Component:** [`framer/CoursesGrid.tsx`](framer/CoursesGrid.tsx) - one file, pasted into Framer verbatim
 **Tests:** [`test/`](test) - 49 tests against that exact file
+**AI session:** [`transcript.html`](transcript.html) - the full Claude Code session, unedited
 
 ```bash
 npm ci
