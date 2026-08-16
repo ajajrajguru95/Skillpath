@@ -105,6 +105,16 @@ class HttpError extends Error {
 }
 
 /**
+ * A property control is still external input: the panel serialises the enum by
+ * its title, and nothing stops a future edit passing something else. Anything
+ * unrecognised becomes IN rather than reaching the formatter lookup, where a
+ * miss would throw and take the whole section down.
+ */
+function toCountryCode(value: unknown): CountryCode {
+    return value === "US" ? "US" : "IN"
+}
+
+/**
  * Both price fields are in minor units: 199900 paise is Rs 1,999.00 and 3999
  * cents is $39.99. Dividing by 100 is the entire trick - formatting the raw
  * integer would render Rs 1,99,900.00, which is the documented way to fail.
@@ -408,7 +418,14 @@ function useCourseData(fallbackCurrency: CountryCode, enabled: boolean) {
  * inline so it stays next to the element it applies to.
  */
 const STYLE_SHEET = `
-.sp-root { position: relative; width: 100%; box-sizing: border-box; }
+.sp-root {
+  position: relative;
+  width: 100%;
+  box-sizing: border-box;
+  /* Named explicitly so the grid matches the page around it. Framer loads this
+     family for the rest of the site; the stack after it is the fallback. */
+  font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
 .sp-root *, .sp-root *::before, .sp-root *::after { box-sizing: border-box; }
 
 .sp-clamp {
@@ -674,7 +691,7 @@ export default function CoursesGrid(props: CoursesGridProps) {
     // fetch there means the first paint is skeletons rather than an empty box.
     const isStatic = useIsStaticRenderer()
     const { state, isSlow, isRetryingCountry, reload, retryCountry } = useCourseData(
-        fallbackCurrency,
+        toCountryCode(fallbackCurrency),
         !isStatic
     )
 
